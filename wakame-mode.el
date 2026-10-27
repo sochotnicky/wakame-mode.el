@@ -208,6 +208,16 @@ to the heartbeat last in past 2 minutes"
   "Handler for buffer focus change."
   (wakame--add-heartbeat (wakame--create-heartbeat nil)))
 
+(defun wakame--handle-first-change()
+  "Handler for first modification of a buffer.
+
+Internal buffers (name starting with a space) are skipped.  These
+include the temporary buffers `call-process' inserts output into,
+and creating a heartbeat there would run git via `process-file',
+i.e. `call-process' recursively."
+  (unless (string-prefix-p " " (buffer-name))
+    (wakame--buffer-change)))
+
 (defun wakame-mode--enable()
   "Add hooks to enable wakame tracking.
 
@@ -216,7 +226,7 @@ The API secret is not read here; see `wakame--lookup-secret'."
         wakame--secret-failed-at nil)
   (setq wakame--idle-timer (run-with-idle-timer 10 t (lambda() (wakame--send-all-heartbeats))))
   (add-to-list 'window-selection-change-functions #'wakame--buffer-change)
-  (add-hook 'first-change-hook #'wakame--buffer-change)
+  (add-hook 'first-change-hook #'wakame--handle-first-change)
   (add-hook 'after-save-hook #'wakame--handle-save))
 
 (defun wakame-mode--disable()
@@ -224,7 +234,7 @@ The API secret is not read here; see `wakame--lookup-secret'."
   (if (timerp wakame--idle-timer) (cancel-timer wakame--idle-timer))
   (setq window-selection-change-functions (delete #'wakame--buffer-change window-selection-change-functions))
   (remove-hook 'after-save-hook #'wakame--handle-save)
-  (remove-hook 'first-change-hook #'wakame--buffer-change))
+  (remove-hook 'first-change-hook #'wakame--handle-first-change))
 
 ;;;###autoload
 (define-minor-mode wakame-mode
