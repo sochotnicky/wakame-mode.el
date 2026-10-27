@@ -52,8 +52,19 @@
   :type 'string
   :group 'wakame)
 
+(defcustom wakame-secret-retry-delay 300
+  "Seconds to wait before retrying a failed or cancelled secret lookup."
+  :type 'integer
+  :group 'wakame)
+
 (defvar wakame--secret '()
   "Secret for given wakame server from auth-source")
+
+(defvar wakame--secret-failed-at nil
+  "Time of the last failed secret lookup, or nil.")
+
+(defvar wakame--secret-lookup-pending nil
+  "Non-nil while a secret lookup is scheduled.")
 
 (defvar wakame--heartbeats '()
   "List of heartbeats yet to be sent to wakatime.")
@@ -110,13 +121,54 @@ If SAVEP is non-nil record writing heartbeat"
     (entity . ,(wakame--current-entity))))
 
 
+(defun wakame--lookup-secret ()
+  "Look up the API secret via auth-source.
+
+This may decrypt an encrypted auth-source file and therefore block
+on a pinentry prompt, so it is only run shortly after user activity
+(see `wakame--maybe-lookup-secret'), never during init or from the
+idle timer.  Errors and quits are caught so a cancelled or timed-out
+prompt only delays the next attempt by `wakame-secret-retry-delay'."
+  (setq wakame--secret-lookup-pending nil)
+  (unless wakame--secret
+    (condition-case err
+        (setq wakame--secret
+              (car (auth-source-search
+                    :host (url-host (url-generic-parse-url wakame-api-url))
+                    :user "wakame" :max 1)))
+      ((error quit)
+       (message "wakame: could not read API secret: %S" err)))
+    (setq wakame--secret-failed-at (unless wakame--secret (float-time)))))
+
+(defun wakame--maybe-lookup-secret ()
+  "Schedule a secret lookup if none is known and none is pending.
+
+The lookup runs from a timer rather than directly, because this is
+called from `window-selection-change-functions', where blocking on a
+prompt is unsafe."
+  (unless (or wakame--secret
+              wakame--secret-lookup-pending
+              (and wakame--secret-failed-at
+                   (< (- (float-time) wakame--secret-failed-at)
+                      wakame-secret-retry-delay)))
+    (setq wakame--secret-lookup-pending t)
+    (run-at-time 0 nil #'wakame--lookup-secret)))
+
+(defun wakame--secret-string ()
+  "Return the API secret as a string, or nil if it is not known yet."
+  (when-let* ((secret (plist-get wakame--secret :secret)))
+    (if (functionp secret) (funcall secret) secret)))
+
 (defun wakame--send-all-heartbeats ()
-  "Sends next batch of 25 heartbeats using bulk API endpoint."
-  (if-let* ((url-request-method "POST")
+  "Sends next batch of 25 heartbeats using bulk API endpoint.
+
+Does nothing until the secret is known; heartbeats stay queued."
+  (if-let* ((secret (wakame--secret-string))
+            (url-request-method "POST")
             (current-heartbeats (last wakame--heartbeats 25))
             (url-request-data (encode-coding-string (json-encode current-heartbeats) 'utf-8))
             (url-request-extra-headers
-             `(("Authorization" . ,(format "Basic %s" (base64-encode-string (funcall (plist-get wakame--secret :secret)))))
+             `(("Authorization" . ,(format "Basic %s" (base64-encode-string secret)))
                ("Content-Type" . "application/json")
                ("X-Machine-Name" . ,(system-name)))))
       (progn
@@ -145,7 +197,8 @@ to the heartbeat last in past 2 minutes"
         (progn
           (setq wakame--last-heartbeat-time (alist-get 'time heartbeat))
           (setq wakame--last-heartbeat-entity (alist-get 'entity heartbeat))
-          (add-to-list 'wakame--heartbeats heartbeat)))))
+          (add-to-list 'wakame--heartbeats heartbeat)
+          (wakame--maybe-lookup-secret)))))
 
 (defun wakame--handle-save()
   "Handler for buffer save."
@@ -156,20 +209,22 @@ to the heartbeat last in past 2 minutes"
   (wakame--add-heartbeat (wakame--create-heartbeat nil)))
 
 (defun wakame-mode--enable()
-  "Add hooks to enable wakame tracking."
-  (setq wakame--secret (car (auth-source-search :host (url-host (url-generic-parse-url wakame-api-url))
-                                                :user "wakame" :max 1)))
+  "Add hooks to enable wakame tracking.
+
+The API secret is not read here; see `wakame--lookup-secret'."
+  (setq wakame--secret nil
+        wakame--secret-failed-at nil)
   (setq wakame--idle-timer (run-with-idle-timer 10 t (lambda() (wakame--send-all-heartbeats))))
   (add-to-list 'window-selection-change-functions #'wakame--buffer-change)
-  (add-hook 'first-change-hook 'wakame--buffer-change nil t)
-  (add-hook 'after-save-hook #'wakame--handle-save nil t))
+  (add-hook 'first-change-hook #'wakame--buffer-change)
+  (add-hook 'after-save-hook #'wakame--handle-save))
 
 (defun wakame-mode--disable()
   "Remove hooks and disable wakame tracking."
   (if (timerp wakame--idle-timer) (cancel-timer wakame--idle-timer))
   (setq window-selection-change-functions (delete #'wakame--buffer-change window-selection-change-functions))
-  (remove-hook 'after-save-hook #'wakame--handle-save t)
-  (remove-hook 'first-change-hook #'wakame--buffer-change t))
+  (remove-hook 'after-save-hook #'wakame--handle-save)
+  (remove-hook 'first-change-hook #'wakame--buffer-change))
 
 ;;;###autoload
 (define-minor-mode wakame-mode
