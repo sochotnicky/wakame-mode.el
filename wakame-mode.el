@@ -57,6 +57,11 @@
   :type 'integer
   :group 'wakame)
 
+(defcustom wakame-secret-lookup-idle-delay 1
+  "Seconds of idle time to wait before looking up the API secret."
+  :type 'number
+  :group 'wakame)
+
 (defvar wakame--secret '()
   "Secret for given wakame server from auth-source")
 
@@ -125,34 +130,40 @@ If SAVEP is non-nil record writing heartbeat"
   "Look up the API secret via auth-source.
 
 This may decrypt an encrypted auth-source file and therefore block
-on a pinentry prompt, so it is only run shortly after user activity
-(see `wakame--maybe-lookup-secret'), never during init or from the
-idle timer.  Errors and quits are caught so a cancelled or timed-out
-prompt only delays the next attempt by `wakame-secret-retry-delay'."
-  (setq wakame--secret-lookup-pending nil)
-  (unless wakame--secret
-    (condition-case err
-        (setq wakame--secret
-              (car (auth-source-search
-                    :host (url-host (url-generic-parse-url wakame-api-url))
-                    :user "wakame" :max 1)))
-      ((error quit)
-       (message "wakame: could not read API secret: %S" err)))
-    (setq wakame--secret-failed-at (unless wakame--secret (float-time)))))
+on a pinentry prompt, so it is only run once Emacs goes idle after
+user activity (see `wakame--maybe-lookup-secret'), never during init
+or from the heartbeat timer.  While a minibuffer is active the lookup
+is postponed to the next idle period instead: a pinentry prompt
+cannot pop up its window from a selected minibuffer, and prompting in
+the middle of another prompt is confusing anyway.  Errors and quits
+are caught so a cancelled or timed-out prompt only delays the next
+attempt by `wakame-secret-retry-delay'."
+  (if (active-minibuffer-window)
+      (run-with-idle-timer wakame-secret-lookup-idle-delay nil #'wakame--lookup-secret)
+    (setq wakame--secret-lookup-pending nil)
+    (unless wakame--secret
+      (condition-case err
+          (setq wakame--secret
+                (car (auth-source-search
+                      :host (url-host (url-generic-parse-url wakame-api-url))
+                      :user "wakame" :max 1)))
+        ((error quit)
+         (message "wakame: could not read API secret: %S" err)))
+      (setq wakame--secret-failed-at (unless wakame--secret (float-time))))))
 
 (defun wakame--maybe-lookup-secret ()
   "Schedule a secret lookup if none is known and none is pending.
 
-The lookup runs from a timer rather than directly, because this is
-called from `window-selection-change-functions', where blocking on a
-prompt is unsafe."
+The lookup runs from an idle timer rather than directly, because this
+is called from `window-selection-change-functions', where blocking on
+a prompt is unsafe."
   (unless (or wakame--secret
               wakame--secret-lookup-pending
               (and wakame--secret-failed-at
                    (< (- (float-time) wakame--secret-failed-at)
                       wakame-secret-retry-delay)))
     (setq wakame--secret-lookup-pending t)
-    (run-at-time 0 nil #'wakame--lookup-secret)))
+    (run-with-idle-timer wakame-secret-lookup-idle-delay nil #'wakame--lookup-secret)))
 
 (defun wakame--secret-string ()
   "Return the API secret as a string, or nil if it is not known yet."
