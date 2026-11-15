@@ -110,15 +110,46 @@
         (goto-char (point-min))
         (buffer-substring-no-properties (point) (line-end-position))))))
 
+(defun wakame--vc-info-available-p ()
+  "Return non-nil if git and project info can be read for `default-directory'.
+
+Local directories always qualify.  Remote ones only when their Tramp
+connection is already established: heartbeats are created from a
+timer, which can fire while Tramp itself is still connecting or
+waiting for output (redisplay runs the hooks that queue heartbeats,
+and Tramp lets timers created during its waits run).  Opening or
+reusing that connection from the timer then fails with \"Forbidden
+reentrant call of Tramp\" and can break the connection being set up."
+  (or (not (file-remote-p default-directory))
+      (file-remote-p default-directory nil 'connected)))
+
 (defun wakame--create-heartbeat(savep &optional time)
   "Return a new heartbeat.
 
-If SAVEP is non-nil record writing heartbeat.  TIME defaults to now."
+If SAVEP is non-nil record writing heartbeat.  TIME defaults to now.
+
+Branch and project are only looked up when that does not open a
+remote connection (see `wakame--vc-info-available-p'), with
+`non-essential' bound so Tramp never prompts or connects, and
+errors (e.g. a busy Tramp connection) just leave them empty."
+  (let* ((non-essential t)
+         (vc-info (wakame--vc-info-available-p))
+         (branch (and vc-info
+                      (condition-case nil (wakame--git-branch-name)
+                        (error nil))))
+         (project (and vc-info
+                       (condition-case nil (project-current)
+                         (error nil)))))
+    (wakame--make-heartbeat savep time branch
+                            (if project (project-name project) ""))))
+
+(defun wakame--make-heartbeat(savep time branch project)
+  "Return a heartbeat with SAVEP, TIME, BRANCH and PROJECT."
   `(
     (type . ,(wakame--current-type))
     (time . ,(or time (float-time)))
-    (branch . ,(wakame--git-branch-name))
-    (project . ,(if (project-current) (project-name (project-current)) ""))
+    (branch . ,branch)
+    (project . ,project)
     (language . ,(wakame--pretty-mode))
     (is_write . ,savep)
     ;; See ParseUserAgent at https://github.com/muety/wakapi/blob/master/utils/http.go
@@ -229,15 +260,37 @@ to the heartbeat last in past 2 minutes"
           (add-to-list 'wakame--heartbeats heartbeat)
           (wakame--maybe-lookup-secret)))))
 
-(defun wakame--queue-heartbeat(savep)
-  "Add a heartbeat for the current buffer from a timer.
+(defvar wakame--pending-heartbeats '()
+  "Heartbeats queued by hooks, newest first.
+Each element is (BUFFER SAVEP TIME).")
 
+(defvar wakame--pending-timer nil
+  "Idle timer adding the heartbeats in `wakame--pending-heartbeats'.")
+
+(defun wakame--queue-heartbeat(savep)
+  "Queue a heartbeat for the current buffer.
+
+The heartbeat is created later by `wakame--add-pending-heartbeats'
+from an idle timer, because creating it runs git via `process-file'.
 Hooks can run in the middle of `call-process' (e.g. window change
-functions from redisplay), and creating a heartbeat runs git via
-`process-file', which would then fail with \"call-process invoked
-recursively\".  Timers never run inside `call-process'."
-  (run-at-time 0 nil #'wakame--add-queued-heartbeat
-               (current-buffer) savep (float-time)))
+functions from redisplay), where that fails with \"call-process
+invoked recursively\", and in the middle of a Tramp operation, where
+a nested remote call fails with \"Forbidden reentrant call of Tramp\"
+and can kill the connection the outer operation is using.
+
+A timer created here would not help with the latter: Tramp suspends
+existing timers while it waits for output, but runs timers created
+during that wait.  The idle timer is created when the mode is
+enabled, so it is suspended as well, and idle timers only run once
+the current command has finished."
+  (push (list (current-buffer) savep (float-time)) wakame--pending-heartbeats))
+
+(defun wakame--add-pending-heartbeats()
+  "Add the heartbeats queued by `wakame--queue-heartbeat'."
+  (let ((pending (nreverse wakame--pending-heartbeats)))
+    (setq wakame--pending-heartbeats nil)
+    (pcase-dolist (`(,buffer ,savep ,time) pending)
+      (wakame--add-queued-heartbeat buffer savep time))))
 
 (defun wakame--add-queued-heartbeat(buffer savep time)
   "Add a heartbeat for BUFFER with SAVEP recorded at TIME."
@@ -270,6 +323,7 @@ The API secret is not read here; see `wakame--lookup-secret'."
         wakame--secret-failed-at nil
         wakame--secret-lookup-pending nil)
   (setq wakame--idle-timer (run-with-idle-timer 10 t (lambda() (wakame--send-all-heartbeats))))
+  (setq wakame--pending-timer (run-with-idle-timer 0.5 t #'wakame--add-pending-heartbeats))
   (add-to-list 'window-selection-change-functions #'wakame--buffer-change)
   (add-hook 'first-change-hook #'wakame--handle-first-change)
   (add-hook 'after-save-hook #'wakame--handle-save))
@@ -277,6 +331,8 @@ The API secret is not read here; see `wakame--lookup-secret'."
 (defun wakame-mode--disable()
   "Remove hooks and disable wakame tracking."
   (if (timerp wakame--idle-timer) (cancel-timer wakame--idle-timer))
+  (if (timerp wakame--pending-timer) (cancel-timer wakame--pending-timer))
+  (setq wakame--pending-heartbeats nil)
   (setq window-selection-change-functions (delete #'wakame--buffer-change window-selection-change-functions))
   (remove-hook 'after-save-hook #'wakame--handle-save)
   (remove-hook 'first-change-hook #'wakame--handle-first-change)
